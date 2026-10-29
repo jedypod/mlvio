@@ -7,6 +7,8 @@
 //!
 //! - [`block`]: block tags, the 16-byte block header and one typed struct per
 //!   metadata block, all parsed from byte slices. No I/O.
+//! - [`scan`]: the [`ReadAt`] positional-read trait and a block
+//!   iterator that walks a chunk reading only headers.
 //! - [`decode`]: 10/12/14-bit unpackers and the lossless JPEG (LJ92) decoder.
 //!
 //! The output contract is a `u16` Bayer mosaic plane at the stored bit depth
@@ -26,7 +28,12 @@ pub mod block;
 pub mod decode;
 mod error;
 
+#[cfg(feature = "std")]
+pub mod scan;
+
 pub use error::{Error, Lj92Error, Result, Unsupported};
 
 pub use block::{Block, BlockHeader, Cfa, Tag};
 
+#[cfg(feature = "std")]
+pub use scan::ReadAt;
