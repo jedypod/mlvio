@@ -7,6 +7,7 @@
 //!
 //! - [`block`]: block tags, the 16-byte block header and one typed struct per
 //!   metadata block, all parsed from byte slices. No I/O.
+//! - [`decode`]: 10/12/14-bit unpackers and the lossless JPEG (LJ92) decoder.
 //!
 //! The output contract is a `u16` Bayer mosaic plane at the stored bit depth
 //! plus enough metadata ([`ClipInfo`]) to linearise and colour it.
@@ -22,6 +23,7 @@
 extern crate alloc;
 
 pub mod block;
+pub mod decode;
 mod error;
 
 pub use error::{Error, Lj92Error, Result, Unsupported};
