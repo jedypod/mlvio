@@ -1,0 +1,19 @@
+mlvio: third-party notices
+
+The MLV container layout, block field names and constants are facts about the
+Magic Lantern Video file format, documented in Magic Lantern's `mlv.h` and
+`raw.h` and on the Magic Lantern wiki. No Magic Lantern or MLV-App source code
+(GPL) is included in this crate; those projects were consulted only as
+behavioural references.
+
+src/decode/lj92.rs
+    Lossless JPEG decoder derived from liblj92 by Andrew Baldwin
+    (https://bitbucket.org/baldand/mlrawviewer, MIT) via the Rust
+    translation in the `libmlv` crate by Ilia Sibiryakov (offered under MIT).
+    Copyright (c) 2014 Andrew Baldwin, (c) 2024 Ilia Sibiryakov.
+    Substantially rewritten for bounds safety and multi-table support; the
+    original MIT notice is retained in the file.
+
+src/decode/unpack.rs
+    Bit layouts follow the `raw_pixblock` bitfield description in Magic
+    Lantern's `raw.h` (format fact). Implementation written independently.

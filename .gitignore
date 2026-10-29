@@ -1,0 +1,9 @@
+target/
+Cargo.lock
+tests/fixtures/*
+!tests/fixtures/.gitkeep
+*.pgm
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/Cargo.lock

@@ -1,0 +1,38 @@
+[package]
+name = "mlvio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Reader for Magic Lantern Video (MLV) raw clips: chunks, metadata, uncompressed and LJ92 frames"
+repository = "https://github.com/jedypod/mlvio"
+keywords = ["mlv", "magic-lantern", "raw", "video", "bayer"]
+categories = ["multimedia::video", "parser-implementations"]
+readme = "README.md"
+autobins = false
+exclude = ["tests/fixtures/*", "fuzz/*", ".github/*"]
+
+[lib]
+name = "mlvio"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+mmap = ["std", "dep:memmap2"]
+serde = ["dep:serde"]
+cli = ["std", "dep:clap"]
+
+[dependencies]
+memmap2 = { version = "0.9", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+clap = { version = "4.5", features = ["derive"], optional = true }
+
+[dev-dependencies]
+
+[profile.release]
+debug = 1
+
+[workspace]
+members = ["."]
+exclude = ["fuzz"]
