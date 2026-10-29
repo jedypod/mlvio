@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use mlvio::block::{Block, parse_block};
-use mlvio::scan::{BlockIter, MAX_META_PAYLOAD, read_payload};
+use mlvio::scan::{BlockIter, read_payload};
 use mlvio::{Clip, Tag};
 
 #[derive(Parser)]
@@ -185,10 +185,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     );
 
     for w in clip.warnings() {
-        println!(
-            "Warning: chunk {} offset {}: {}",
-            w.chunk, w.offset, w.message
-        );
+        println!("Warning: {w}");
     }
 
     if args.blocks || args.meta {
@@ -208,7 +205,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                     header.tag, header.size, header.timestamp
                 );
                 if args.meta && !header.tag.is_frame() && header.tag != Tag::MLVI {
-                    let payload = read_payload(src, offset, &header, MAX_META_PAYLOAD.min(4096))?;
+                    let payload = read_payload(src, offset, &header, 4096)?;
                     match parse_block(&header, &payload) {
                         Block::Unknown { .. } | Block::Null => {}
                         b => println!("      {b:?}"),
@@ -222,7 +219,11 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let meta = clip.frame_meta(n)?;
         println!(
             "Frame {n}: number {}  ts {} us  chunk {}  crop {:?}  pan {:?}",
-            meta.frame_number, meta.timestamp, meta.chunk, meta.crop_pos, meta.pan_pos
+            meta.frame.frame_number,
+            meta.frame.timestamp,
+            meta.frame.chunk,
+            meta.frame.crop_pos,
+            meta.frame.pan_pos
         );
         if let Some(e) = &meta.exposure {
             println!(

@@ -80,7 +80,7 @@ fn lj92_14bit_clip_decodes() {
         );
     }
     let f0 = clip.frame(0).unwrap();
-    assert_eq!(f0.meta.frame_number, 0);
+    assert_eq!(f0.meta.frame.frame_number, 0);
     assert!(f0.meta.exposure.is_some());
     assert!(f0.meta.lens.is_some());
 }

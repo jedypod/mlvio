@@ -2,7 +2,6 @@
 //! Error types. Library code never panics on input data; every failure is one
 //! of these variants.
 
-use alloc::string::String;
 use core::fmt;
 
 use crate::block::Tag;
@@ -12,6 +11,7 @@ pub type Result<T, E = Error> = core::result::Result<T, E>;
 
 /// Video class flags / formats the crate recognises but does not decode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Unsupported {
     /// `MLV_VIDEO_CLASS_FLAG_LZMA` (0x80).
@@ -46,6 +46,7 @@ impl fmt::Display for Unsupported {
 
 /// Lossless JPEG decoder failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Lj92Error {
     /// Stream does not begin with SOI (`FF D8`).
@@ -105,13 +106,22 @@ impl core::error::Error for Lj92Error {}
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Error {
-    /// Underlying I/O failure.
+    /// Underlying I/O failure while reading a source.
     #[cfg(feature = "std")]
     Io(std::io::Error),
-    /// The file does not start with an `MLVI` block.
+    /// A chunk file could not be opened.
+    #[cfg(feature = "std")]
+    Open {
+        /// The file that failed to open.
+        path: std::path::PathBuf,
+        /// The underlying error, with its OS error code intact.
+        source: std::io::Error,
+    },
+    /// The source does not start with an `MLVI` block.
+    #[cfg(feature = "std")]
     NotMlv {
-        /// Path or description of the source.
-        path: String,
+        /// Path of the source, or `None` for an in-memory source.
+        path: Option<std::path::PathBuf>,
     },
     /// A block header or payload is inconsistent.
     BadBlock {
@@ -126,12 +136,15 @@ pub enum Error {
         /// Byte offset of the incomplete block.
         offset: u64,
     },
-    /// A block required for decoding (`RAWI`, `MLVI`) was not found.
+    /// A block required for decoding was not found. Today this is only
+    /// `RAWI`; a source without `MLVI` is reported as [`Error::NotMlv`].
     MissingBlock(Tag),
     /// A sibling chunk carries a different `fileGuid`.
+    #[cfg(feature = "std")]
     ChunkGuidMismatch {
-        /// Path of the chunk that disagrees.
-        path: String,
+        /// Path of the chunk that disagrees, or `None` for an in-memory
+        /// source.
+        path: Option<std::path::PathBuf>,
         /// GUID of the main `.MLV` file.
         expected: u64,
         /// GUID found in the offending chunk.
@@ -146,12 +159,20 @@ pub enum Error {
         /// Bytes present.
         got: usize,
     },
-    /// Decoded sample count does not match `xRes * yRes`, or the caller's
-    /// destination slice has the wrong length.
-    GeometryMismatch {
-        /// Expected sample count.
+    /// The caller's destination slice does not hold `width * height`
+    /// samples. This is a caller error, not a problem with the file.
+    DestinationSize {
+        /// Required length in samples.
         expected: usize,
-        /// Actual sample count.
+        /// Supplied length.
+        got: usize,
+    },
+    /// The compressed frame's own geometry disagrees with `RAWI`
+    /// (`xRes * yRes`), so the file is inconsistent.
+    GeometryMismatch {
+        /// Sample count from `RAWI`.
+        expected: usize,
+        /// Sample count the frame encodes.
         got: usize,
     },
     /// Recognised but unsupported encoding.
@@ -160,12 +181,29 @@ pub enum Error {
     Lj92(Lj92Error),
 }
 
+#[cfg(feature = "std")]
+fn path_or_memory(p: &Option<std::path::PathBuf>) -> std::borrow::Cow<'_, str> {
+    match p {
+        Some(p) => p.to_string_lossy(),
+        None => std::borrow::Cow::Borrowed("<memory>"),
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             #[cfg(feature = "std")]
             Error::Io(e) => write!(f, "I/O error: {e}"),
-            Error::NotMlv { path } => write!(f, "{path}: not an MLV file (no MLVI header)"),
+            #[cfg(feature = "std")]
+            Error::Open { path, source } => {
+                write!(f, "cannot open {}: {source}", path.display())
+            }
+            #[cfg(feature = "std")]
+            Error::NotMlv { path } => write!(
+                f,
+                "{}: not an MLV file (no MLVI header)",
+                path_or_memory(path)
+            ),
             Error::BadBlock { offset, reason } => {
                 write!(f, "bad block at offset {offset}: {reason}")
             }
@@ -173,20 +211,25 @@ impl fmt::Display for Error {
                 write!(f, "file truncated inside block at offset {offset}")
             }
             Error::MissingBlock(tag) => write!(f, "required block {tag} not found"),
+            #[cfg(feature = "std")]
             Error::ChunkGuidMismatch {
                 path,
                 expected,
                 got,
             } => write!(
                 f,
-                "chunk {path} has fileGuid {got:#018x}, expected {expected:#018x}"
+                "chunk {} has fileGuid {got:#018x}, expected {expected:#018x}",
+                path_or_memory(path)
             ),
             Error::FrameOutOfRange(i) => write!(f, "frame index {i} out of range"),
             Error::FrameTooShort { expected, got } => {
                 write!(f, "frame payload is {got} bytes, need {expected}")
             }
+            Error::DestinationSize { expected, got } => {
+                write!(f, "destination has {got} samples, need {expected}")
+            }
             Error::GeometryMismatch { expected, got } => {
-                write!(f, "decoded {got} samples, expected {expected}")
+                write!(f, "frame encodes {got} samples, RAWI says {expected}")
             }
             Error::Unsupported(u) => write!(f, "unsupported: {u}"),
             Error::Lj92(e) => write!(f, "LJ92 decode failed: {e}"),
@@ -199,6 +242,8 @@ impl core::error::Error for Error {
         match self {
             #[cfg(feature = "std")]
             Error::Io(e) => Some(e),
+            #[cfg(feature = "std")]
+            Error::Open { source, .. } => Some(source),
             Error::Lj92(e) => Some(e),
             _ => None,
         }

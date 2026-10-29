@@ -60,7 +60,7 @@ fn out_of_order_frames_are_sorted_by_timestamp_and_duplicates_dropped() {
     assert!(clip.info().out_of_order);
     for (i, expected) in frames.iter().enumerate() {
         let f = clip.frame(i).unwrap();
-        assert_eq!(f.meta.frame_number, i as u32);
+        assert_eq!(f.meta.frame.frame_number, i as u32);
         assert_eq!(&f.data, expected);
     }
     assert_eq!(clip.warnings().len(), 1);
@@ -78,11 +78,12 @@ fn chunks_are_merged_in_file_num_order_and_guid_checked() {
     // Pass chunks in scrambled order; fileNum must win.
     let clip = Clip::from_sources(vec![c0.finish(), c2.finish(), c1.finish()]).unwrap();
     assert_eq!(clip.chunk_count(), 3);
+    assert_eq!(clip.info().chunk_count, 3);
     assert_eq!(clip.frame_count(), 3);
     for (i, expected) in f.iter().enumerate() {
         let fr = clip.frame(i).unwrap();
         assert_eq!(&fr.data, expected);
-        assert_eq!(fr.meta.chunk as usize, i);
+        assert_eq!(fr.meta.frame.chunk as usize, i);
     }
 
     let mut bad = MlvWriter::new(0xBAD, 1, 2);
@@ -124,7 +125,8 @@ fn truncated_tail_is_a_warning_not_an_error() {
     let clip = Clip::from_sources(vec![w.finish()]).unwrap();
     assert_eq!(clip.frame_count(), 1);
     assert_eq!(clip.warnings().len(), 1);
-    assert!(clip.warnings()[0].message.contains("ends inside"));
+    assert_eq!(clip.warnings()[0].kind, mlvio::WarningKind::TruncatedTail);
+    assert!(clip.warnings()[0].to_string().contains("ends inside"));
     assert_eq!(clip.frame(0).unwrap().data, frame(1, 14));
 }
 
@@ -153,7 +155,7 @@ fn errors_are_typed() {
     let mut small = vec![0u16; 3];
     assert!(matches!(
         clip.read_frame(0, &mut small),
-        Err(Error::GeometryMismatch { .. })
+        Err(Error::DestinationSize { .. })
     ));
     // Unsupported classes open fine but refuse to decode.
     for (class, want) in [
@@ -166,7 +168,7 @@ fn errors_are_typed() {
         let mut w = basic(14).video_class(class);
         w.vidf(1, 0, 0, &f, 14);
         let clip = Clip::from_sources(vec![w.finish()]).unwrap();
-        assert_eq!(clip.info().compression, Compression::Unsupported(class));
+        assert_eq!(clip.info().compression, Compression::Unsupported(want));
         match clip.frame(0) {
             Err(Error::Unsupported(u)) => assert_eq!(u, want),
             other => panic!("class {class:#x}: {:?}", other.map(|_| ())),
@@ -222,4 +224,74 @@ fn open_discovers_chunk_files_on_disk() {
     let single = Clip::open_single(dir.join("Take.MLV")).unwrap();
     assert_eq!(single.frame_count(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn hostile_rawi_rectangles_fall_back_to_the_whole_frame() {
+    let mut w = MlvWriter::new(7, 0, 1);
+    w.rawi_with_areas(
+        W,
+        H,
+        14,
+        2048,
+        15000,
+        [i32::MIN, 5, i32::MAX, -1],
+        [i32::MAX, i32::MIN, i32::MIN, i32::MAX],
+    );
+    w.vidf(1, 0, 0, &frame(1, 14), 14);
+    let clip = Clip::from_sources(vec![w.finish()]).unwrap();
+    let whole = mlvio::Rect {
+        x: 0,
+        y: 0,
+        width: W as u32,
+        height: H as u32,
+    };
+    assert_eq!(clip.info().active_area, whole);
+    assert_eq!(clip.info().crop, whole);
+    // A sane, partial active area survives.
+    let mut w = MlvWriter::new(7, 0, 1);
+    w.rawi_with_areas(W, H, 14, 2048, 15000, [2, 4, 10, 8], [1, 3, 20, 60]);
+    w.vidf(1, 0, 0, &frame(1, 14), 14);
+    let info = Clip::from_sources(vec![w.finish()]).unwrap().info().clone();
+    assert_eq!(
+        (info.crop.x, info.crop.y, info.crop.width, info.crop.height),
+        (2, 4, 10, 8)
+    );
+    let a = info.active_area;
+    assert_eq!((a.x, a.y, a.width, a.height), (3, 1, 57, 19));
+}
+
+#[test]
+fn raw_payload_plus_decode_payload_matches_read_frame_and_read_meta_works() {
+    let mut w = basic(12);
+    let f0 = frame(5, 12);
+    w.vidf_padded(1000, 0, 16, &f0, 12, 8);
+    let clip = Clip::from_sources(vec![w.finish()]).unwrap();
+
+    let mut bytes = vec![0xAAu8; 3]; // stale content must be replaced
+    clip.raw_payload(0, &mut bytes).unwrap();
+    let mut via_payload = vec![0u16; f0.len()];
+    clip.decode_payload(&bytes, &mut via_payload).unwrap();
+    let mut via_read = vec![0u16; f0.len()];
+    let mut scratch = mlvio::FrameScratch::new();
+    clip.read_frame_with(0, &mut via_read, &mut scratch)
+        .unwrap();
+    assert_eq!(via_payload, f0);
+    assert_eq!(via_read, f0);
+
+    let idnt = clip
+        .meta_blocks()
+        .iter()
+        .find(|m| m.header.tag == mlvio::Tag::IDNT)
+        .unwrap();
+    match clip.read_meta(idnt).unwrap() {
+        mlvio::Block::Identity(id) => assert_eq!(id.camera_name_str(), "Canon EOS 5D Mark III"),
+        other => panic!("unexpected {other:?}"),
+    }
+    // Blocks the clip layer does not consume are still listed.
+    assert!(
+        clip.meta_blocks()
+            .iter()
+            .any(|m| m.header.tag == mlvio::Tag::MLVI)
+    );
 }

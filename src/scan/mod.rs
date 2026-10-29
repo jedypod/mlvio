@@ -15,19 +15,26 @@ use crate::block::BlockHeader;
 pub const MAX_META_PAYLOAD: usize = 16 << 20;
 
 /// Positional, shared-reference reads from a byte source.
-pub trait ReadAt: Sync {
+///
+/// `Clip<R>` is `Send`/`Sync` exactly when `R` is, so implement this for a
+/// `Sync` type (such as `File`, a slice or a memory map) to decode frames
+/// from several threads over one open clip.
+pub trait ReadAt {
     /// Fill `buf` with the bytes starting at `pos`.
     ///
     /// Fails with [`io::ErrorKind::UnexpectedEof`] if the source ends before
     /// `buf` is full.
     fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<()>;
 
-    /// Total length of the source in bytes.
-    fn len(&self) -> u64;
+    /// Total size of the source in bytes.
+    fn size(&self) -> u64;
 
-    /// True if the source holds no bytes.
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// The whole source as a slice, if it is already in memory.
+    ///
+    /// Sources that can provide this (slices, `Vec<u8>`, memory maps) let
+    /// the clip layer decode frames without copying the payload first.
+    fn as_slice(&self) -> Option<&[u8]> {
+        None
     }
 }
 
@@ -48,8 +55,12 @@ impl ReadAt for [u8] {
         slice_read_at(self, pos, buf)
     }
 
-    fn len(&self) -> u64 {
-        <[u8]>::len(self) as u64
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        Some(self)
     }
 }
 
@@ -58,44 +69,37 @@ impl ReadAt for alloc::vec::Vec<u8> {
         slice_read_at(self, pos, buf)
     }
 
-    fn len(&self) -> u64 {
-        alloc::vec::Vec::len(self) as u64
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        Some(self)
     }
 }
 
-impl<T: ReadAt + ?Sized> ReadAt for &T {
-    fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
-        (**self).read_exact_at(pos, buf)
-    }
+macro_rules! forward_read_at {
+    ($($ty:ty),*) => {$(
+        impl<T: ReadAt + ?Sized> ReadAt for $ty {
+            fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
+                (**self).read_exact_at(pos, buf)
+            }
 
-    fn len(&self) -> u64 {
-        (**self).len()
-    }
+            fn size(&self) -> u64 {
+                (**self).size()
+            }
+
+            fn as_slice(&self) -> Option<&[u8]> {
+                (**self).as_slice()
+            }
+        }
+    )*};
 }
 
-impl<T: ReadAt + ?Sized> ReadAt for alloc::boxed::Box<T> {
-    fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
-        (**self).read_exact_at(pos, buf)
-    }
+forward_read_at!(&T, alloc::boxed::Box<T>, std::sync::Arc<T>);
 
-    fn len(&self) -> u64 {
-        (**self).len()
-    }
-}
-
-impl<T: ReadAt + ?Sized + Send> ReadAt for std::sync::Arc<T> {
-    fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
-        (**self).read_exact_at(pos, buf)
-    }
-
-    fn len(&self) -> u64 {
-        (**self).len()
-    }
-}
-
-/// Reads use `pread`-style positional I/O. [`ReadAt::len`] queries the file
-/// metadata on every call; wrap the file in your own type if that matters.
-/// A failed metadata query reports a length of 0.
+/// Reads use `pread`-style positional I/O. [`ReadAt::size`] queries the file
+/// metadata on every call; a failed query reports a size of 0.
 impl ReadAt for std::fs::File {
     #[cfg(unix)]
     fn read_exact_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<()> {
@@ -119,7 +123,7 @@ impl ReadAt for std::fs::File {
         Ok(())
     }
 
-    fn len(&self) -> u64 {
+    fn size(&self) -> u64 {
         self.metadata().map(|m| m.len()).unwrap_or(0)
     }
 }
@@ -130,8 +134,24 @@ impl ReadAt for memmap2::Mmap {
         slice_read_at(self, pos, buf)
     }
 
-    fn len(&self) -> u64 {
-        <[u8]>::len(self) as u64
+    fn size(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        Some(self)
+    }
+}
+
+/// Map an I/O failure at block `offset`: a short read means the chunk is
+/// truncated, anything else is passed through.
+fn io_at(offset: u64) -> impl FnOnce(io::Error) -> Error {
+    move |e| {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            Error::Truncated { offset }
+        } else {
+            Error::Io(e)
+        }
     }
 }
 
@@ -153,7 +173,7 @@ fn header_at(source_len: u64, offset: u64, bytes: &[u8; 16]) -> Result<BlockHead
 /// extends past the end of the source, and with [`Error::BadBlock`] if
 /// `blockSize < 16`.
 pub fn read_header<R: ReadAt + ?Sized>(source: &R, offset: u64) -> Result<BlockHeader, Error> {
-    read_header_len(source, source.len(), offset)
+    read_header_len(source, source.size(), offset)
 }
 
 fn read_header_len<R: ReadAt + ?Sized>(
@@ -166,18 +186,37 @@ fn read_header_len<R: ReadAt + ?Sized>(
         _ => return Err(Error::Truncated { offset }),
     }
     let mut buf = [0u8; 16];
-    source.read_exact_at(offset, &mut buf).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            Error::Truncated { offset }
-        } else {
-            Error::Io(e)
-        }
-    })?;
+    source
+        .read_exact_at(offset, &mut buf)
+        .map_err(io_at(offset))?;
     header_at(len, offset, &buf)
 }
 
+/// Read the start of the payload of the block at `offset` (the bytes after
+/// its 16-byte header) into `buf`, up to `buf.len()` bytes.
+///
+/// Returns the number of bytes read, which is the smaller of the payload
+/// length and `buf.len()`. Reads nothing beyond the block, and does not
+/// allocate or query the source size, so it suits per-block work during
+/// indexing.
+pub fn read_payload_into<R: ReadAt + ?Sized>(
+    source: &R,
+    offset: u64,
+    header: &BlockHeader,
+    buf: &mut [u8],
+) -> Result<usize, Error> {
+    let n = header.payload_len().min(buf.len());
+    let start = offset
+        .checked_add(BlockHeader::SIZE as u64)
+        .ok_or(Error::Truncated { offset })?;
+    source
+        .read_exact_at(start, &mut buf[..n])
+        .map_err(io_at(offset))?;
+    Ok(n)
+}
+
 /// Read the payload of the block at `offset` (the bytes after its 16-byte
-/// header), at most `max_len` bytes.
+/// header) into a new vector, at most `max_len` bytes.
 ///
 /// Use [`MAX_META_PAYLOAD`] as `max_len` for metadata blocks.
 pub fn read_payload<R: ReadAt + ?Sized>(
@@ -186,22 +225,8 @@ pub fn read_payload<R: ReadAt + ?Sized>(
     header: &BlockHeader,
     max_len: usize,
 ) -> Result<Vec<u8>, Error> {
-    let n = header.payload_len().min(max_len);
-    let start = offset
-        .checked_add(BlockHeader::SIZE as u64)
-        .ok_or(Error::Truncated { offset })?;
-    match start.checked_add(n as u64) {
-        Some(end) if end <= source.len() => {}
-        _ => return Err(Error::Truncated { offset }),
-    }
-    let mut buf = alloc::vec![0u8; n];
-    source.read_exact_at(start, &mut buf).map_err(|e| {
-        if e.kind() == io::ErrorKind::UnexpectedEof {
-            Error::Truncated { offset }
-        } else {
-            Error::Io(e)
-        }
-    })?;
+    let mut buf = alloc::vec![0u8; header.payload_len().min(max_len)];
+    read_payload_into(source, offset, header, &mut buf)?;
     Ok(buf)
 }
 
@@ -227,12 +252,12 @@ impl<'a, R: ReadAt + ?Sized> BlockIter<'a, R> {
 
     /// Iterate starting at byte `offset`, which must be a block boundary.
     ///
-    /// The source length is sampled once here.
+    /// The source size is sampled once here.
     pub fn from_offset(source: &'a R, offset: u64) -> Self {
         BlockIter {
             source,
             offset,
-            len: source.len(),
+            len: source.size(),
             done: false,
         }
     }
@@ -240,6 +265,11 @@ impl<'a, R: ReadAt + ?Sized> BlockIter<'a, R> {
     /// Offset of the next block to be read.
     pub fn offset(&self) -> u64 {
         self.offset
+    }
+
+    /// Source size as sampled when the iterator was created.
+    pub fn source_size(&self) -> u64 {
+        self.len
     }
 }
 
@@ -307,14 +337,21 @@ mod tests {
         assert_eq!(p, vec![9u8; 40]);
         let p = read_payload(src, items[2].0, &items[2].1, 10).unwrap();
         assert_eq!(p.len(), 10);
+        let mut small = [0u8; 64];
+        assert_eq!(
+            read_payload_into(src, items[2].0, &items[2].1, &mut small).unwrap(),
+            40
+        );
+        assert_eq!(&small[..40], &[9u8; 40]);
         assert_eq!(read_header(src, 52).unwrap().tag, Tag::NULL);
 
-        // Vec and Box / Arc wrappers work too.
+        // Vec and Box / Arc wrappers work too, and expose the slice.
         assert_eq!(BlockIter::new(&data).count(), 3);
         let b: Box<[u8]> = data.clone().into_boxed_slice();
         assert_eq!(BlockIter::new(&b).count(), 3);
         let a = std::sync::Arc::new(data.clone());
         assert_eq!(BlockIter::new(&a).count(), 3);
+        assert_eq!(a.as_slice().unwrap().len(), data.len());
     }
 
     #[test]
@@ -388,5 +425,21 @@ mod tests {
         let mut buf = [0u8; 2];
         ReadAt::read_exact_at(src, 1, &mut buf).unwrap();
         assert_eq!(buf, [2, 3]);
+    }
+
+    #[test]
+    fn payload_past_end_is_truncated() {
+        let mut data = three();
+        data.truncate(data.len() - 5);
+        let src: &[u8] = &data;
+        let h = BlockHeader {
+            tag: Tag::VIDF,
+            size: 56,
+            timestamp: 7,
+        };
+        assert!(matches!(
+            read_payload(src, 68, &h, MAX_META_PAYLOAD),
+            Err(Error::Truncated { offset: 68 })
+        ));
     }
 }

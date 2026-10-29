@@ -93,8 +93,26 @@ impl MlvWriter {
         self
     }
 
-    /// Append a 180-byte `RAWI` block (xRes, yRes, 160-byte `raw_info`).
+    /// Append a 180-byte `RAWI` block (xRes, yRes, 160-byte `raw_info`) with
+    /// the crop and active area covering the whole frame.
     pub fn rawi(&mut self, x_res: u16, y_res: u16, bpp: u32, black: i32, white: i32) -> &mut Self {
+        let (w, h) = (i32::from(x_res), i32::from(y_res));
+        self.rawi_with_areas(x_res, y_res, bpp, black, white, [0, 0, w, h], [0, 0, h, w])
+    }
+
+    /// Like [`rawi`](Self::rawi) with explicit `crop` (origin x, y, size w, h)
+    /// and `active_area` (y1, x1, y2, x2) values, which may be garbage.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rawi_with_areas(
+        &mut self,
+        x_res: u16,
+        y_res: u16,
+        bpp: u32,
+        black: i32,
+        white: i32,
+        crop: [i32; 4],
+        active_area: [i32; 4],
+    ) -> &mut Self {
         let width = i32::from(x_res);
         let height = i32::from(y_res);
         let pitch = width * bpp as i32 / 8;
@@ -114,8 +132,8 @@ impl MlvWriter {
             &mut p,
             &[height, width, pitch, frame_size, bpp as i32, black, white],
         );
-        i32s(&mut p, &[0, 0, width, height]); // crop origin x,y / size w,h
-        i32s(&mut p, &[0, 0, height, width]); // active_area y1,x1,y2,x2
+        i32s(&mut p, &crop);
+        i32s(&mut p, &active_area);
         i32s(&mut p, &[0, 1]); // exposure_bias
         p.extend_from_slice(&0x0201_0100u32.to_le_bytes()); // cfa_pattern (RGGB)
         i32s(&mut p, &[21]); // calibration_illuminant1 (D65)

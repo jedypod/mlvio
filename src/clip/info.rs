@@ -6,7 +6,7 @@ use crate::block::{
     Block, Cfa, Curve, DateTime, DualIso, Exposure, FileHeader, Identity, Info, Lens, RawCapture,
     RawInfo, Version, WallClock, WavInfo, WhiteBalance,
 };
-use crate::{Error, Result, Tag};
+use crate::{Error, Result, Tag, Unsupported};
 
 /// Axis-aligned rectangle in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,17 +22,44 @@ pub struct Rect {
     pub height: u32,
 }
 
-/// Frame encoding, from `videoClass`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Frame encoding, derived from `videoClass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Compression {
     /// Packed 10/12/14-bit samples.
-    #[default]
     None,
     /// Lossless JPEG.
     Lj92,
-    /// Something this crate does not decode; the raw `videoClass` value.
-    Unsupported(u16),
+    /// Something this crate does not decode. The raw `videoClass` value is
+    /// in [`ClipInfo::file_header`].
+    Unsupported(Unsupported),
+}
+
+impl Compression {
+    /// Classify a `videoClass` value.
+    pub fn from_video_class(class: u16) -> Compression {
+        let unsupported = if class == 0 {
+            Some(Unsupported::AudioOnly)
+        } else if class & FileHeader::FLAG_MCRAW != 0 {
+            Some(Unsupported::McRaw)
+        } else if class & FileHeader::FLAG_LZMA != 0 {
+            Some(Unsupported::Lzma)
+        } else if class & FileHeader::FLAG_DELTA != 0 {
+            Some(Unsupported::Delta)
+        } else if class & FileHeader::FLAG_JPEG2K != 0 {
+            Some(Unsupported::Jpeg2000)
+        } else if class & 0x0F != FileHeader::VIDEO_CLASS_RAW {
+            Some(Unsupported::VideoClass(class))
+        } else {
+            None
+        };
+        match unsupported {
+            Some(u) => Compression::Unsupported(u),
+            None if class & FileHeader::FLAG_LJ92 != 0 => Compression::Lj92,
+            None => Compression::None,
+        }
+    }
 }
 
 /// Camera identity from `IDNT`.
@@ -52,7 +79,8 @@ pub struct CameraId {
 /// The flattened fields at the top are what a raw pipeline needs. The
 /// `Option<Block>` fields underneath expose the parsed source blocks for
 /// anything else.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClipInfo {
     /// Stored frame width (`RAWI.xRes`).
@@ -142,11 +170,31 @@ pub(super) struct InfoBuilder {
     versions: Vec<Version>,
     wav_info: Option<WavInfo>,
     dark_frame: Option<(u16, u64)>,
-    chunks: u16,
     pub(super) audio_frames: usize,
 }
 
 impl InfoBuilder {
+    /// Tags whose payload the builder or the timelines consume. Other
+    /// metadata blocks are indexed by location only and never parsed.
+    pub(super) fn wants(tag: Tag) -> bool {
+        matches!(
+            tag,
+            Tag::RAWI
+                | Tag::RAWC
+                | Tag::IDNT
+                | Tag::RTCI
+                | Tag::DISO
+                | Tag::CURV
+                | Tag::INFO
+                | Tag::VERS
+                | Tag::WAVI
+                | Tag::DARK
+                | Tag::EXPO
+                | Tag::WBAL
+                | Tag::LENS
+        )
+    }
+
     pub(super) fn new(file_header: FileHeader) -> Self {
         InfoBuilder {
             file_header,
@@ -160,13 +208,11 @@ impl InfoBuilder {
             versions: Vec::new(),
             wav_info: None,
             dark_frame: None,
-            chunks: 0,
             audio_frames: 0,
         }
     }
 
     pub(super) fn absorb(&mut self, timestamp: u64, block: Block, chunk: u16, offset: u64) {
-        self.chunks = self.chunks.max(chunk + 1);
         match block {
             Block::RawInfo(b) => {
                 self.raw_info.get_or_insert(b);
@@ -205,6 +251,7 @@ impl InfoBuilder {
 
     pub(super) fn finish(
         self,
+        chunk_count: usize,
         frame_count: usize,
         expo: &[(u64, Exposure)],
         wbal: &[(u64, WhiteBalance)],
@@ -212,32 +259,23 @@ impl InfoBuilder {
     ) -> Result<ClipInfo> {
         let raw_info = self.raw_info.ok_or(Error::MissingBlock(Tag::RAWI))?;
         let fh = self.file_header;
-        let width = raw_info.x_res as u32;
-        let height = raw_info.y_res as u32;
-
-        let class = fh.video_class;
-        let compression = if class & 0x0F != FileHeader::VIDEO_CLASS_RAW
-            || class
-                & (FileHeader::FLAG_LZMA
-                    | FileHeader::FLAG_DELTA
-                    | FileHeader::FLAG_JPEG2K
-                    | FileHeader::FLAG_MCRAW)
-                != 0
-        {
-            Compression::Unsupported(class)
-        } else if class & FileHeader::FLAG_LJ92 != 0 {
-            Compression::Lj92
-        } else {
-            Compression::None
-        };
+        let width = u32::from(raw_info.x_res);
+        let height = u32::from(raw_info.y_res);
 
         let aa = &raw_info.active_area;
-        let active_area = clamp_rect(aa.x1, aa.y1, aa.x2 - aa.x1, aa.y2 - aa.y1, width, height);
+        let active_area = clamp_rect(
+            aa.x1,
+            aa.y1,
+            raw_info.active_width(),
+            raw_info.active_height(),
+            width,
+            height,
+        );
         let crop = clamp_rect(
             raw_info.crop_origin[0],
             raw_info.crop_origin[1],
-            raw_info.crop_size[0],
-            raw_info.crop_size[1],
+            raw_info.crop_size[0].max(0) as u32,
+            raw_info.crop_size[1].max(0) as u32,
             width,
             height,
         );
@@ -245,12 +283,11 @@ impl InfoBuilder {
         let camera = self
             .identity
             .as_ref()
-            .map(|id| CameraId {
+            .map_or_else(CameraId::default, |id| CameraId {
                 name: id.camera_name_str().to_string(),
                 model_id: id.camera_model,
                 serial: id.camera_serial_str().to_string(),
-            })
-            .unwrap_or_default();
+            });
 
         Ok(ClipInfo {
             width,
@@ -267,11 +304,11 @@ impl InfoBuilder {
             fps_rational: (fh.fps_num, fh.fps_den),
             frame_count,
             audio_frame_count: self.audio_frames,
-            compression,
+            compression: Compression::from_video_class(fh.video_class),
             dual_iso: self.dual_iso.as_ref().is_some_and(|d| d.is_active()),
             camera,
             recorded_at: self.wall_clock.as_ref().and_then(|(_, w)| w.to_datetime()),
-            chunk_count: self.chunks.max(1) as usize,
+            chunk_count,
             out_of_order: fh.out_of_order(),
             dropped_frames: fh.dropped_frames(),
             file_header: fh,
@@ -293,23 +330,25 @@ impl InfoBuilder {
 }
 
 /// Clamp a possibly-garbage rectangle to the frame; falls back to the whole
-/// frame when the input is empty or inverted.
-fn clamp_rect(x: i32, y: i32, w: i32, h: i32, fw: u32, fh: u32) -> Rect {
-    if w <= 0 || h <= 0 || x < 0 || y < 0 || x as u32 >= fw || y as u32 >= fh {
-        return Rect {
-            x: 0,
-            y: 0,
-            width: fw,
-            height: fh,
-        };
+/// frame when the input is empty or starts outside it.
+fn clamp_rect(x: i32, y: i32, w: u32, h: u32, fw: u32, fh: u32) -> Rect {
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: fw,
+        height: fh,
+    };
+    let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
+        return whole;
+    };
+    if w == 0 || h == 0 || x >= fw || y >= fh {
+        return whole;
     }
-    let x = x as u32;
-    let y = y as u32;
     Rect {
         x,
         y,
-        width: (w as u32).min(fw - x),
-        height: (h as u32).min(fh - y),
+        width: w.min(fw - x),
+        height: h.min(fh - y),
     }
 }
 
@@ -319,6 +358,12 @@ mod tests {
 
     #[test]
     fn clamp_rect_handles_garbage() {
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        };
         assert_eq!(
             clamp_rect(0, 0, 1600, 900, 1600, 900),
             Rect {
@@ -337,23 +382,42 @@ mod tests {
                 height: 880
             }
         );
+        assert_eq!(clamp_rect(-5, 0, 10, 10, 100, 100), whole);
+        assert_eq!(clamp_rect(0, 0, 0, 0, 100, 100), whole);
+        assert_eq!(clamp_rect(i32::MIN, i32::MAX, u32::MAX, 1, 100, 100), whole);
+    }
+
+    #[test]
+    fn video_class_classification() {
+        assert_eq!(Compression::from_video_class(0x01), Compression::None);
+        assert_eq!(Compression::from_video_class(0x21), Compression::Lj92);
         assert_eq!(
-            clamp_rect(-5, 0, 10, 10, 100, 100),
-            Rect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100
-            }
+            Compression::from_video_class(0),
+            Compression::Unsupported(Unsupported::AudioOnly)
         );
         assert_eq!(
-            clamp_rect(0, 0, 0, 0, 100, 100),
-            Rect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100
-            }
+            Compression::from_video_class(0x81),
+            Compression::Unsupported(Unsupported::Lzma)
+        );
+        assert_eq!(
+            Compression::from_video_class(0xA1),
+            Compression::Unsupported(Unsupported::Lzma)
+        );
+        assert_eq!(
+            Compression::from_video_class(0x41),
+            Compression::Unsupported(Unsupported::Delta)
+        );
+        assert_eq!(
+            Compression::from_video_class(0x11),
+            Compression::Unsupported(Unsupported::Jpeg2000)
+        );
+        assert_eq!(
+            Compression::from_video_class(0x101),
+            Compression::Unsupported(Unsupported::McRaw)
+        );
+        assert_eq!(
+            Compression::from_video_class(0x02),
+            Compression::Unsupported(Unsupported::VideoClass(2))
         );
     }
 }

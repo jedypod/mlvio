@@ -52,6 +52,9 @@ pub use error::{Error, Lj92Error, Result, Unsupported};
 pub use block::{Block, BlockHeader, Cfa, Tag};
 
 #[cfg(feature = "std")]
-pub use clip::{Clip, ClipInfo, Compression, Frame, FrameMeta, FrameRef, FrameScratch, Rect};
+pub use clip::{
+    CameraId, Clip, ClipInfo, Compression, Frame, FrameMeta, FrameRef, FrameScratch, MetaRef, Rect,
+    Warning, WarningKind,
+};
 #[cfg(feature = "std")]
 pub use scan::ReadAt;
