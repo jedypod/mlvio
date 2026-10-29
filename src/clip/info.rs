@@ -93,7 +93,8 @@ pub struct ClipInfo {
     pub black_level: u32,
     /// White level in sample units.
     pub white_level: u32,
-    /// Colour filter array layout.
+    /// Colour filter array layout at the stored frame's origin. `RAWI`
+    /// anchors it at the active area's origin, as DNG does.
     pub cfa: Cfa,
     /// DNG-style active area in stored-frame coordinates. `RAWI` records it
     /// in sensor-buffer coordinates; the frame is the window at the first
@@ -301,7 +302,9 @@ impl InfoBuilder {
             bits_per_pixel: raw_info.bits_per_pixel.max(0) as u32,
             black_level: raw_info.black_level.max(0) as u32,
             white_level: raw_info.white_level.max(0) as u32,
-            cfa: raw_info.cfa(),
+            cfa: raw_info
+                .cfa()
+                .shifted(cx - i64::from(aa.x1), cy - i64::from(aa.y1)),
             active_area,
             crop,
             color_matrix: raw_info.color_matrix(),

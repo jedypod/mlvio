@@ -203,6 +203,18 @@ impl Cfa {
             Cfa::Unknown(_) => None,
         }
     }
+
+    /// The arrangement seen from a window whose origin is `dx` columns and
+    /// `dy` rows from this tile's origin. Only the parity of each offset
+    /// matters; [`Cfa::Unknown`] is returned unchanged.
+    pub fn shifted(self, dx: i64, dy: i64) -> Self {
+        let Some(p) = self.pattern() else {
+            return self;
+        };
+        let (sx, sy) = ((dx & 1) as usize, (dy & 1) as usize);
+        let at = |x: usize, y: usize| p[((y + sy) & 1) * 2 + ((x + sx) & 1)];
+        Self::from_pattern(u32::from_le_bytes([at(0, 0), at(1, 0), at(0, 1), at(1, 1)]))
+    }
 }
 
 impl fmt::Display for Cfa {
@@ -1431,6 +1443,19 @@ pub fn parse_block(header: &BlockHeader, payload: &[u8]) -> Block {
 
 #[cfg(test)]
 mod tests {
+    use super::Cfa;
+
+    #[test]
+    fn cfa_shift_follows_offset_parity() {
+        assert_eq!(Cfa::Rggb.shifted(0, 0), Cfa::Rggb);
+        assert_eq!(Cfa::Rggb.shifted(1, 0), Cfa::Grbg);
+        assert_eq!(Cfa::Rggb.shifted(0, 1), Cfa::Gbrg);
+        assert_eq!(Cfa::Rggb.shifted(1, 1), Cfa::Bggr);
+        assert_eq!(Cfa::Rggb.shifted(-64, 178), Cfa::Rggb);
+        assert_eq!(Cfa::Gbrg.shifted(-1, 0), Cfa::Bggr);
+        assert_eq!(Cfa::Unknown(7).shifted(1, 1), Cfa::Unknown(7));
+    }
+
     use super::*;
     use alloc::string::ToString;
     use alloc::vec;
