@@ -9,12 +9,16 @@ repository = "https://github.com/jedypod/mlvio"
 keywords = ["mlv", "magic-lantern", "raw", "video", "bayer"]
 categories = ["multimedia::video", "parser-implementations"]
 readme = "README.md"
-autobins = false
 exclude = ["tests/fixtures/*", "fuzz/*", ".github/*"]
 
 [lib]
 name = "mlvio"
 path = "src/lib.rs"
+
+[[bin]]
+name = "mlvinfo"
+path = "src/bin/mlvinfo.rs"
+required-features = ["cli"]
 
 [features]
 default = ["std"]
