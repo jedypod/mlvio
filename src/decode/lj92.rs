@@ -55,10 +55,16 @@ const M_SOF3: u8 = 0xC3;
 /// Maximum components per scan this decoder accepts.
 pub const MAX_COMPONENTS: usize = 4;
 
+/// Lookup entry for a bit pattern that is not a code: SSSS 0 with a code
+/// length of 63, which no real code can have. "Consuming" it wraps the bit
+/// reader's count past 64 and the row check reports `BadCode`.
+const BAD_CODE_ENTRY: u16 = 63;
+
 /// One Huffman table expanded to a direct lookup.
 ///
 /// Entry `i` (indexed by the next `max_bits` bits of the stream) holds
-/// `(ssss << 8) | code_length`, or 0 for a bit pattern that is not a code.
+/// `(ssss << 8) | code_length`, or [`BAD_CODE_ENTRY`] for a bit pattern that
+/// is not a code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HuffTable {
     max_bits: u8,
@@ -77,7 +83,7 @@ impl HuffTable {
             return Err(Lj92Error::BadHuffmanTable);
         }
         let size = 1usize << max_bits;
-        let mut lut = alloc::vec![0u16; size];
+        let mut lut = alloc::vec![BAD_CODE_ENTRY; size];
 
         // Canonical code assignment: codes of length L are consecutive,
         // starting at (previous code + 1) << 1.
@@ -108,6 +114,23 @@ impl HuffTable {
             code <<= 1;
         }
         Ok(HuffTable { max_bits, lut })
+    }
+}
+
+/// Borrowed view of a [`HuffTable`] held by value in the decode loop so the
+/// table pointer, length and code width stay in registers.
+#[derive(Clone, Copy)]
+struct TableRef<'a> {
+    lut: &'a [u16],
+    max_bits: u32,
+}
+
+impl HuffTable {
+    fn as_ref(&self) -> TableRef<'_> {
+        TableRef {
+            lut: &self.lut,
+            max_bits: self.max_bits as u32,
+        }
     }
 }
 
@@ -298,8 +321,22 @@ pub fn parse(data: &[u8]) -> Result<Lj92Header> {
 
 /// Bit reader over entropy-coded data with `FF 00` unstuffing.
 ///
-/// Reading past the end of the data, or into a marker, feeds zero bits and
-/// counts them; [`BitReader::finish`] turns an overrun into an error.
+/// The accumulator is left-aligned: the next bit of the stream is bit 63 of
+/// `acc`, and `cnt` bits are valid. [`BitReader::refill`] guarantees at
+/// least 32 bits, so after one refill a full symbol (a code of at most 16
+/// bits plus up to 16 value bits) can be consumed without further checks.
+///
+/// Refilling takes a fast path when eight raw bytes are available and none of
+/// them is `0xFF`: the bytes are loaded as one big-endian word and inserted
+/// whole. Otherwise it falls back to a byte-at-a-time loop that unstuffs
+/// `FF 00`, stops at any other marker and at the end of the data, and feeds
+/// zero bits from then on while counting them in `pad_bits`;
+/// [`BitReader::finish`] turns an overrun into an error.
+///
+/// Decoding never fails mid-symbol. An unassigned code pattern hits
+/// [`BAD_CODE_ENTRY`], which "consumes" 63 bits and so drives `cnt` past 64
+/// (it can never legitimately exceed 64); the row loop checks that once per
+/// row, which keeps the `Result` out of the per-sample path.
 struct BitReader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -311,6 +348,16 @@ struct BitReader<'a> {
     pad_bits: u32,
     /// True once a marker (other than a stuffed `FF 00`) was reached.
     hit_marker: bool,
+}
+
+/// True if any byte of `w` is `0xFF`.
+#[inline(always)]
+fn has_ff_byte(w: u64) -> bool {
+    // Classic "has zero byte" test applied to the complement.
+    let x = !w;
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    (x.wrapping_sub(LO) & !x & HI) != 0
 }
 
 impl<'a> BitReader<'a> {
@@ -325,7 +372,42 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Ensure at least 32 valid bits are buffered (enough for one symbol:
+    /// a code of at most 16 bits plus at most 16 value bits). Refilling only
+    /// when the accumulator is half empty lets the fast path insert four or
+    /// more bytes at a time.
     #[inline(always)]
+    fn refill(&mut self) {
+        if self.cnt >= 32 {
+            return;
+        }
+        if let Some(chunk) = self.data.get(self.pos..self.pos + 8) {
+            let w = u64::from_be_bytes(chunk.try_into().expect("8-byte slice"));
+            if !has_ff_byte(w) {
+                // Insert as many whole bytes as fit above the valid bits.
+                let nbytes = (64 - self.cnt) >> 3;
+                let keep = nbytes << 3;
+                self.acc |= (w >> (64 - keep)) << (64 - keep - self.cnt);
+                self.cnt += keep;
+                self.pos += nbytes as usize;
+                return;
+            }
+        }
+        self.refill_slow();
+    }
+
+    /// Byte-at-a-time refill: handles `FF 00` stuffing, markers and the end
+    /// of the data.
+    #[cold]
+    #[inline(never)]
+    fn refill_slow(&mut self) {
+        while self.cnt <= 56 {
+            let b = self.next_byte();
+            self.acc |= (b as u64) << (56 - self.cnt);
+            self.cnt += 8;
+        }
+    }
+
     fn next_byte(&mut self) -> u8 {
         if self.hit_marker {
             self.pad_bits += 8;
@@ -355,61 +437,54 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Ensure at least 32 valid bits are buffered.
+    /// Decode one difference value using `t`.
+    ///
+    /// Branch free apart from the refill check. An unassigned bit pattern
+    /// hits [`BAD_CODE_ENTRY`], which poisons `cnt`; the caller checks it
+    /// once per row.
     #[inline(always)]
-    fn refill(&mut self) {
-        while self.cnt <= 56 {
-            let b = self.next_byte();
-            self.acc |= (b as u64) << (56 - self.cnt);
-            self.cnt += 8;
-        }
-    }
-
-    #[inline(always)]
-    fn peek(&self, n: u8) -> u32 {
-        debug_assert!(n > 0 && n <= 32);
-        (self.acc >> (64 - n as u32)) as u32
-    }
-
-    #[inline(always)]
-    fn consume(&mut self, n: u32) {
-        self.acc <<= n;
-        self.cnt -= n;
-    }
-
-    /// Decode one difference value using `table`. Requires `refill` to have
-    /// been called with no more than 32 bits consumed since.
-    #[inline(always)]
-    fn next_diff(&mut self, table: &HuffTable) -> Result<i32> {
+    fn next_diff(&mut self, t: TableRef<'_>) -> i32 {
         self.refill();
-        let idx = self.peek(table.max_bits) as usize;
-        // `idx < 1 << max_bits == lut.len()` by construction.
-        let entry = table.lut[idx];
-        if entry == 0 {
-            return Err(Lj92Error::BadCode);
+        let idx = (self.acc >> (64 - t.max_bits)) as usize;
+        // `idx < 1 << max_bits == lut.len()` by construction; the fallback
+        // only exists to keep the index in bounds without a panic path.
+        let entry = t.lut.get(idx).copied().unwrap_or(BAD_CODE_ENTRY) as u32;
+        let len = entry & 0xFF;
+        let ssss = entry >> 8;
+        // SSSS 16 carries no value bits and means +32768; otherwise SSSS
+        // value bits follow the code.
+        let extra = ssss & 15;
+        // `>> 1 >> (63 - extra)` reads `extra` bits and is well defined for
+        // `extra == 0`.
+        let v = ((self.acc << len) >> 1 >> (63 - extra)) as i32;
+        self.acc <<= len + extra;
+        // Wraps only for `BAD_CODE_ENTRY`, which `check_row` detects.
+        self.cnt = self.cnt.wrapping_sub(len + extra);
+        // Values below 2^(extra-1) are negative: v - 2^extra + 1.
+        let half = (1i32 << extra) >> 1;
+        let neg = -((v < half) as i32);
+        v + (neg & (1 - (1i32 << extra))) + (((ssss >> 4) as i32) << 15)
+    }
+
+    /// Per-row health check: a bad code is fatal, and a stream that ended
+    /// more than a word ago is reported as truncated instead of producing a
+    /// frame of garbage.
+    #[inline(always)]
+    fn check_row(&self) -> Result<()> {
+        if self.cnt > 64 {
+            Err(Lj92Error::BadCode)
+        } else if self.pad_bits > 64 + self.cnt {
+            Err(Lj92Error::ScanTruncated)
+        } else {
+            Ok(())
         }
-        let len = (entry & 0xFF) as u32;
-        let ssss = (entry >> 8) as u32;
-        self.consume(len);
-        Ok(match ssss {
-            0 => 0,
-            16 => 32768,
-            t => {
-                // After consuming <= 16 code bits we still have >= 41 bits.
-                let v = self.peek(t as u8) as i32;
-                self.consume(t);
-                if v < (1 << (t - 1)) {
-                    v + ((-1i32) << t) + 1
-                } else {
-                    v
-                }
-            }
-        })
     }
 
     /// Fail if more bits were consumed than the data contained.
     fn finish(self) -> Result<()> {
-        if self.pad_bits > self.cnt {
+        if self.cnt > 64 {
+            Err(Lj92Error::BadCode)
+        } else if self.pad_bits > self.cnt {
             Err(Lj92Error::ScanTruncated)
         } else {
             Ok(())
@@ -431,17 +506,17 @@ pub fn decode_into(data: &[u8], hdr: &Lj92Header, out: &mut [u16]) -> Result<()>
         });
     }
     let ncomp = hdr.components as usize;
-    let mut tables: [&HuffTable; MAX_COMPONENTS] = [&EMPTY_TABLE; MAX_COMPONENTS];
+    let mut tables: [TableRef<'_>; MAX_COMPONENTS] = [EMPTY_TABLE.as_ref(); MAX_COMPONENTS];
     for (slot, &t) in tables.iter_mut().zip(&hdr.table_of).take(ncomp) {
         *slot = hdr.tables[t as usize]
             .as_ref()
-            .ok_or(Lj92Error::BadHuffmanTable)?;
+            .ok_or(Lj92Error::BadHuffmanTable)?
+            .as_ref();
     }
     let mut br = BitReader::new(data, hdr.scan_start);
     let init = 1i32 << (hdr.precision - hdr.point_transform - 1);
     let p = Params {
         width: hdr.width as usize,
-        height: hdr.height as usize,
         ncomp,
         init,
     };
@@ -466,7 +541,6 @@ static EMPTY_TABLE: HuffTable = HuffTable {
 
 struct Params {
     width: usize,
-    height: usize,
     ncomp: usize,
     init: i32,
 }
@@ -488,74 +562,73 @@ fn predict<const P: u8>(a: i32, b: i32, c: i32) -> i32 {
 
 fn decode_rows<const P: u8>(
     br: &mut BitReader<'_>,
-    tables: &[&HuffTable; MAX_COMPONENTS],
+    tables: &[TableRef<'_>; MAX_COMPONENTS],
     p: &Params,
     out: &mut [u16],
 ) -> Result<()> {
-    let row_len = p.width * p.ncomp;
     let ncomp = p.ncomp;
+    let row_len = p.width * ncomp;
+    let mut rows = out.chunks_exact_mut(row_len);
 
-    // Row 0: first sample from the initial value, the rest from the left.
-    {
-        let row = &mut out[..row_len];
-        for c in 0..ncomp {
-            let d = br.next_diff(tables[c])?;
-            row[c] = (p.init + d) as u16;
-        }
-        for x in ncomp..row_len {
-            let d = br.next_diff(tables[x % ncomp])?;
-            row[x] = (row[x - ncomp] as i32 + d) as u16;
-        }
+    // Row 0: first sample of each component from the initial value, the
+    // rest from the left neighbour of the same component.
+    let first = rows.next().ok_or(Lj92Error::BadFrameHeader)?;
+    for (c, s) in first.iter_mut().take(ncomp).enumerate() {
+        *s = (p.init + br.next_diff(tables[c])) as u16;
     }
+    for x in ncomp..row_len {
+        let d = br.next_diff(tables[x % ncomp]);
+        first[x] = (first[x - ncomp] as i32 + d) as u16;
+    }
+    br.check_row()?;
 
-    // Remaining rows: first sample from above, the rest by predictor P.
-    for y in 1..p.height {
-        let (prev, cur) = out.split_at_mut(y * row_len);
-        let prev = &prev[(y - 1) * row_len..];
-        let cur = &mut cur[..row_len];
+    // Remaining rows: first sample of each component from above, the rest
+    // by predictor P over left `a`, above `b`, above-left `c`.
+    let mut prev: &[u16] = first;
+    for cur in rows {
         for c in 0..ncomp {
-            let d = br.next_diff(tables[c])?;
-            cur[c] = (prev[c] as i32 + d) as u16;
+            cur[c] = (prev[c] as i32 + br.next_diff(tables[c])) as u16;
         }
-        if ncomp == 1 {
-            let t = tables[0];
-            let mut a = cur[0] as i32;
-            for x in 1..row_len {
-                let b = prev[x] as i32;
-                let c = prev[x - 1] as i32;
-                let d = br.next_diff(t)?;
-                a = (predict::<P>(a, b, c) + d) as u16 as i32;
-                cur[x] = a as u16;
+        match ncomp {
+            1 => {
+                let t = tables[0];
+                let mut a = cur[0] as i32;
+                let above = prev[1..].iter().zip(prev.iter());
+                for (o, (&b, &c)) in cur[1..].iter_mut().zip(above) {
+                    let d = br.next_diff(t);
+                    a = (predict::<P>(a, b as i32, c as i32) + d) as u16 as i32;
+                    *o = a as u16;
+                }
             }
-        } else if ncomp == 2 {
-            let (t0, t1) = (tables[0], tables[1]);
-            let mut a0 = cur[0] as i32;
-            let mut a1 = cur[1] as i32;
-            let mut x = 2;
-            while x < row_len {
-                let d0 = br.next_diff(t0)?;
-                a0 = (predict::<P>(a0, prev[x] as i32, prev[x - 2] as i32) + d0) as u16 as i32;
-                cur[x] = a0 as u16;
-                let d1 = br.next_diff(t1)?;
-                a1 = (predict::<P>(a1, prev[x + 1] as i32, prev[x - 1] as i32) + d1) as u16 as i32;
-                cur[x + 1] = a1 as u16;
-                x += 2;
+            2 => {
+                let (t0, t1) = (tables[0], tables[1]);
+                let mut a0 = cur[0] as i32;
+                let mut a1 = cur[1] as i32;
+                // Pairs: `b` is the pair above, `c` the pair above-left.
+                let above = prev[2..].as_chunks::<2>().0.iter();
+                let above_left = prev.as_chunks::<2>().0.iter();
+                let out_pairs = cur[2..].as_chunks_mut::<2>().0.iter_mut();
+                for (o, (b, c)) in out_pairs.zip(above.zip(above_left)) {
+                    let d0 = br.next_diff(t0);
+                    a0 = (predict::<P>(a0, b[0] as i32, c[0] as i32) + d0) as u16 as i32;
+                    o[0] = a0 as u16;
+                    let d1 = br.next_diff(t1);
+                    a1 = (predict::<P>(a1, b[1] as i32, c[1] as i32) + d1) as u16 as i32;
+                    o[1] = a1 as u16;
+                }
             }
-        } else {
-            for x in ncomp..row_len {
-                let c_idx = x % ncomp;
-                let a = cur[x - ncomp] as i32;
-                let b = prev[x] as i32;
-                let c = prev[x - ncomp] as i32;
-                let d = br.next_diff(tables[c_idx])?;
-                cur[x] = (predict::<P>(a, b, c) + d) as u16;
+            _ => {
+                for x in ncomp..row_len {
+                    let a = cur[x - ncomp] as i32;
+                    let b = prev[x] as i32;
+                    let c = prev[x - ncomp] as i32;
+                    let d = br.next_diff(tables[x % ncomp]);
+                    cur[x] = (predict::<P>(a, b, c) + d) as u16;
+                }
             }
         }
-        // Bail out early on streams that ended long ago instead of
-        // producing a frame of garbage.
-        if br.pad_bits > 64 + br.cnt {
-            return Err(Lj92Error::ScanTruncated);
-        }
+        br.check_row()?;
+        prev = cur;
     }
     Ok(())
 }
@@ -884,7 +957,7 @@ mod tests {
         // Codes: 00, 01, 100, 101; 11x are unassigned.
         assert_eq!(t.lut[0b000] & 0xFF, 2);
         assert_eq!(t.lut[0b100] >> 8, 2);
-        assert_eq!(t.lut[0b110], 0);
-        assert_eq!(t.lut[0b111], 0);
+        assert_eq!(t.lut[0b110], BAD_CODE_ENTRY);
+        assert_eq!(t.lut[0b111], BAD_CODE_ENTRY);
     }
 }
