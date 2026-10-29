@@ -1,0 +1,33 @@
+[package]
+name = "mlvio-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mlvio = { path = ".." }
+
+[[bin]]
+name = "lj92"
+path = "fuzz_targets/lj92.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "blocks"
+path = "fuzz_targets/blocks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clip"
+path = "fuzz_targets/clip.rs"
+test = false
+doc = false
+bench = false
