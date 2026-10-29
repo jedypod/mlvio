@@ -10,6 +10,8 @@
 
 pub mod cursor;
 mod tag;
+mod types;
 
 pub use cursor::{Cursor, c_str};
 pub use tag::{BlockHeader, Tag};
+pub use types::*;

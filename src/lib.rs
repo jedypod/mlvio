@@ -26,5 +26,5 @@ mod error;
 
 pub use error::{Error, Lj92Error, Result, Unsupported};
 
-pub use block::{BlockHeader, Tag};
+pub use block::{Block, BlockHeader, Cfa, Tag};
 
