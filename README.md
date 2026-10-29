@@ -43,6 +43,17 @@ use rayon::prelude::*;
 let frames: Vec<_> = (0..clip.frame_count()).into_par_iter().map(|i| clip.frame(i)).collect();
 ```
 
+For a pipeline that separates I/O from decoding, `Clip::raw_payload` fetches
+a frame's bytes and `Clip::decode_payload` turns bytes into samples;
+`read_frame_with` combines them with a reusable scratch buffer. When the
+source is already in memory (a slice, `Vec<u8>`, or a memory map opened with
+`Clip::open_with` and the `mmap` feature) frames are decoded in place
+without copying the payload.
+
+Single-thread decode speed on an EPYC 7302P core: about 150 Msamples/s for
+LJ92 (a 1600x800 14-bit frame in 8.5 ms) and about 1 Gpx/s for packed
+14-bit; `mlvinfo --check --threads N` reports the parallel figure.
+
 ## Features
 
 | Feature | Default | Effect |
@@ -60,6 +71,7 @@ mlvinfo CLIP.MLV                      # chunks, clip info, block histogram
 mlvinfo CLIP.MLV --blocks --meta      # every block header and parsed metadata
 mlvinfo CLIP.MLV --frame 12 --out f12.pgm    # decode one frame to 16-bit PGM
 mlvinfo CLIP.MLV --check              # decode every frame, report speed and errors
+mlvinfo CLIP.MLV --check --threads 8  # the same on eight threads
 ```
 
 ## Layout
