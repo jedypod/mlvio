@@ -8,10 +8,10 @@
 //! This mirrors the `min(blockSize, sizeof(struct))` copy that ML's own
 //! readers perform, because firmware revisions have appended fields.
 
-pub mod cursor;
+pub(crate) mod cursor;
 mod tag;
 mod types;
 
-pub use cursor::{Cursor, c_str};
+pub(crate) use cursor::{Cursor, c_str};
 pub use tag::{BlockHeader, Tag};
 pub use types::*;

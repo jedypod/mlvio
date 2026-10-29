@@ -73,7 +73,7 @@ tags! {
 impl Tag {
     /// Tag as a `&str` if all four bytes are printable ASCII.
     pub fn as_str(&self) -> Option<&str> {
-        if self.0.iter().all(|b| b.is_ascii_graphic()) {
+        if self.0.iter().all(u8::is_ascii_graphic) {
             core::str::from_utf8(&self.0).ok()
         } else {
             None

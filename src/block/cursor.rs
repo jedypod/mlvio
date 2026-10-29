@@ -4,8 +4,7 @@
 //! Firmware revisions have appended fields to several blocks, so readers must
 //! accept short payloads. Every read on an exhausted cursor returns the type's
 //! default (zero) and sets [`Cursor::truncated`], instead of failing. Callers
-//! that need a field to be present check `truncated()` or use the `try_*`
-//! variants.
+//! that need a field to be present check `truncated()`.
 
 /// Little-endian reader over a byte slice that never panics.
 #[derive(Debug, Clone)]
@@ -24,12 +23,6 @@ impl<'a> Cursor<'a> {
             pos: 0,
             truncated: false,
         }
-    }
-
-    /// Current position in bytes.
-    #[inline]
-    pub fn position(&self) -> usize {
-        self.pos
     }
 
     /// Bytes not yet consumed.
@@ -54,16 +47,13 @@ impl<'a> Cursor<'a> {
     #[inline]
     pub fn try_bytes(&mut self, n: usize) -> Option<&'a [u8]> {
         let end = self.pos.checked_add(n)?;
-        match self.data.get(self.pos..end) {
-            Some(s) => {
-                self.pos = end;
-                Some(s)
-            }
-            None => {
-                self.truncated = true;
-                self.pos = self.data.len();
-                None
-            }
+        if let Some(s) = self.data.get(self.pos..end) {
+            self.pos = end;
+            Some(s)
+        } else {
+            self.truncated = true;
+            self.pos = self.data.len();
+            None
         }
     }
 
@@ -113,33 +103,16 @@ impl<'a> Cursor<'a> {
         i32::from_le_bytes(self.array())
     }
 
+    /// Read `N` little-endian `i32`s, each 0 if exhausted.
+    #[inline]
+    pub fn i32s<const N: usize>(&mut self) -> [i32; N] {
+        core::array::from_fn(|_| self.i32())
+    }
+
     /// Read a little-endian `u64`, 0 if exhausted.
     #[inline]
     pub fn u64(&mut self) -> u64 {
         u64::from_le_bytes(self.array())
-    }
-
-    /// Read a `u16` only if fully present.
-    #[inline]
-    pub fn try_u16(&mut self) -> Option<u16> {
-        self.try_bytes(2).map(|s| u16::from_le_bytes([s[0], s[1]]))
-    }
-
-    /// Read a `u32` only if fully present.
-    #[inline]
-    pub fn try_u32(&mut self) -> Option<u32> {
-        self.try_bytes(4)
-            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
-    }
-
-    /// Read a `u64` only if fully present.
-    #[inline]
-    pub fn try_u64(&mut self) -> Option<u64> {
-        self.try_bytes(8).map(|s| {
-            let mut a = [0u8; 8];
-            a.copy_from_slice(s);
-            u64::from_le_bytes(a)
-        })
     }
 }
 

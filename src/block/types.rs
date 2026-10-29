@@ -15,8 +15,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use super::cursor::{Cursor, c_str};
 use super::tag::{BlockHeader, Tag};
+use super::{Cursor, c_str};
 
 /// Decode a byte run as text: stop at the first NUL, replace invalid UTF-8,
 /// trim trailing whitespace.
@@ -113,7 +113,7 @@ impl FileHeader {
         if self.fps_den == 0 {
             0.0
         } else {
-            self.fps_num as f64 / self.fps_den as f64
+            f64::from(self.fps_num) / f64::from(self.fps_den)
         }
     }
 
@@ -159,11 +159,11 @@ pub struct ActiveArea {
 }
 
 /// Bayer colour filter arrangement of the top-left 2x2 tile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum Cfa {
     /// Red, green / green, blue (pattern `0x02010100`).
-    #[default]
     Rggb,
     /// Blue, green / green, red (pattern `0x00010102`).
     Bggr,
@@ -281,21 +281,18 @@ impl RawInfo {
         let bits_per_pixel = c.i32();
         let black_level = c.i32();
         let white_level = c.i32();
-        let crop_origin = [c.i32(), c.i32()];
-        let crop_size = [c.i32(), c.i32()];
+        let crop_origin = c.i32s();
+        let crop_size = c.i32s();
         let active_area = ActiveArea {
             y1: c.i32(),
             x1: c.i32(),
             y2: c.i32(),
             x2: c.i32(),
         };
-        let exposure_bias = [c.i32(), c.i32()];
+        let exposure_bias = c.i32s();
         let cfa_pattern = c.u32();
         let calibration_illuminant1 = c.i32();
-        let mut color_matrix1 = [0i32; 18];
-        for v in &mut color_matrix1 {
-            *v = c.i32();
-        }
+        let color_matrix1 = c.i32s();
         let dynamic_range = c.i32();
         RawInfo {
             x_res,
@@ -337,7 +334,7 @@ impl RawInfo {
             if den == 0 {
                 return None;
             }
-            *o = num as f64 / den as f64;
+            *o = f64::from(num) / f64::from(den);
         }
         Some(out)
     }
@@ -354,7 +351,7 @@ impl RawInfo {
 }
 
 fn span(lo: i32, hi: i32) -> u32 {
-    (hi as i64 - lo as i64).clamp(0, u32::MAX as i64) as u32
+    (i64::from(hi) - i64::from(lo)).clamp(0, i64::from(u32::MAX)) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -404,7 +401,7 @@ impl VideoFrameHeader {
 
     /// Offset of the pixel data from the start of the block.
     pub fn data_offset(&self) -> u64 {
-        (BlockHeader::SIZE + Self::SIZE) as u64 + self.frame_space as u64
+        (BlockHeader::SIZE + Self::SIZE) as u64 + u64::from(self.frame_space)
     }
 
     /// Pixel data length for a block of `block_size` bytes; `None` if
@@ -446,7 +443,7 @@ impl AudioFrameHeader {
 
     /// Offset of the sample data from the start of the block.
     pub fn data_offset(&self) -> u64 {
-        (BlockHeader::SIZE + Self::SIZE) as u64 + self.frame_space as u64
+        (BlockHeader::SIZE + Self::SIZE) as u64 + u64::from(self.frame_space)
     }
 
     /// Sample data length for a block of `block_size` bytes; `None` on
@@ -561,7 +558,7 @@ impl Lens {
 
     /// f-number.
     pub fn aperture(&self) -> f64 {
-        self.aperture_x100 as f64 / 100.0
+        f64::from(self.aperture_x100) / 100.0
     }
 }
 
@@ -792,7 +789,7 @@ impl WallClock {
 
     /// Month 1..=12 (`tm_mon + 1`).
     pub fn month(&self) -> u8 {
-        (self.mon as u8).saturating_add(1)
+        u8::try_from(self.mon.saturating_add(1)).unwrap_or(u8::MAX)
     }
 
     /// Time zone abbreviation, trimmed.
@@ -811,7 +808,7 @@ impl WallClock {
             return None;
         }
         Some(DateTime {
-            year: 1900 + self.year as i32,
+            year: 1900 + i32::from(self.year),
             month: self.mon as u8 + 1,
             day: self.mday as u8,
             hour: self.hour as u8,
@@ -935,7 +932,8 @@ impl Curve {
 
 /// `DARK`: averaged dark frame with the settings it was captured under.
 ///
-/// Pixel data is not copied; it starts at `data_offset_in_payload`.
+/// Pixel data is not copied; it starts at [`DarkFrame::FIXED_SIZE`] bytes
+/// into the payload.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DarkFrame {
@@ -979,14 +977,13 @@ pub struct DarkFrame {
     pub binning_y: u8,
     /// `skipping_y`.
     pub skipping_y: u8,
-    /// Offset of `frameData` from the start of the payload.
-    pub data_offset_in_payload: usize,
     /// Payload was shorter than the fixed fields.
     pub truncated: bool,
 }
 
 impl DarkFrame {
-    /// Length of the fixed fields preceding the pixel data.
+    /// Length of the fixed fields preceding the pixel data; `frameData`
+    /// starts at this offset in the payload.
     pub const FIXED_SIZE: usize = 68;
 
     /// Parse the fixed fields from the block payload.
@@ -1013,7 +1010,6 @@ impl DarkFrame {
             skipping_x: c.u8(),
             binning_y: c.u8(),
             skipping_y: c.u8(),
-            data_offset_in_payload: Self::FIXED_SIZE,
             truncated: false,
         };
         d.truncated = c.truncated();
@@ -1310,6 +1306,7 @@ impl WavInfo {
 /// A parsed block of any type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[non_exhaustive]
 pub enum Block {
     /// `MLVI`.
     FileHeader(FileHeader),
@@ -1865,7 +1862,7 @@ mod tests {
 
         let dark = DarkFrame::from_bytes(&[0u8; 70]);
         assert!(!dark.truncated);
-        assert_eq!(dark.data_offset_in_payload, 68);
+        assert_eq!(DarkFrame::FIXED_SIZE, 68);
         assert!(DarkFrame::from_bytes(&[0u8; 60]).truncated);
     }
 }
