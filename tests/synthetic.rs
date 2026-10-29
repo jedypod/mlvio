@@ -253,12 +253,13 @@ fn hostile_rawi_rectangles_fall_back_to_the_whole_frame() {
     w.rawi_with_areas(W, H, 14, 2048, 15000, [2, 4, 10, 8], [1, 3, 20, 60]);
     w.vidf(1, 0, 0, &frame(1, 14), 14);
     let info = Clip::from_sources(vec![w.finish()]).unwrap().info().clone();
-    assert_eq!(
-        (info.crop.x, info.crop.y, info.crop.width, info.crop.height),
-        (2, 4, 10, 8)
-    );
     let a = info.active_area;
     assert_eq!((a.x, a.y, a.width, a.height), (3, 1, 57, 19));
+    // The default crop origin is relative to the active area, as in DNG.
+    assert_eq!(
+        (info.crop.x, info.crop.y, info.crop.width, info.crop.height),
+        (5, 5, 10, 8)
+    );
 }
 
 #[test]

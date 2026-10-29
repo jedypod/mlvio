@@ -95,9 +95,13 @@ pub struct ClipInfo {
     pub white_level: u32,
     /// Colour filter array layout.
     pub cfa: Cfa,
-    /// DNG-style active area, clamped to the stored frame.
+    /// DNG-style active area in stored-frame coordinates. `RAWI` records it
+    /// in sensor-buffer coordinates; the frame is the window at the first
+    /// frame's `VIDF` crop position, so the area is shifted by that position
+    /// and clamped to the frame.
     pub active_area: Rect,
-    /// DNG default crop (`raw_info.crop`), clamped to the stored frame.
+    /// DNG default crop in stored-frame coordinates. `RAWI` records it
+    /// relative to the active area's origin.
     pub crop: Rect,
     /// `ColorMatrix1` as 9 row-major XYZ-to-camera coefficients.
     pub color_matrix: Option<[f64; 9]>,
@@ -256,6 +260,7 @@ impl InfoBuilder {
         expo: &[(u64, Exposure)],
         wbal: &[(u64, WhiteBalance)],
         lens: &[(u64, Lens)],
+        crop_pos: (u16, u16),
     ) -> Result<ClipInfo> {
         let raw_info = self.raw_info.ok_or(Error::MissingBlock(Tag::RAWI))?;
         let fh = self.file_header;
@@ -263,17 +268,18 @@ impl InfoBuilder {
         let height = u32::from(raw_info.y_res);
 
         let aa = &raw_info.active_area;
-        let active_area = clamp_rect(
-            aa.x1,
-            aa.y1,
+        let (cx, cy) = (i64::from(crop_pos.0), i64::from(crop_pos.1));
+        let active_area = window_rect(
+            i64::from(aa.x1) - cx,
+            i64::from(aa.y1) - cy,
             raw_info.active_width(),
             raw_info.active_height(),
             width,
             height,
         );
-        let crop = clamp_rect(
-            raw_info.crop_origin[0],
-            raw_info.crop_origin[1],
+        let crop = window_rect(
+            i64::from(aa.x1) + i64::from(raw_info.crop_origin[0]) - cx,
+            i64::from(aa.y1) + i64::from(raw_info.crop_origin[1]) - cy,
             raw_info.crop_size[0].max(0) as u32,
             raw_info.crop_size[1].max(0) as u32,
             width,
@@ -331,24 +337,29 @@ impl InfoBuilder {
 
 /// Clamp a possibly-garbage rectangle to the frame; falls back to the whole
 /// frame when the input is empty or starts outside it.
-fn clamp_rect(x: i32, y: i32, w: u32, h: u32, fw: u32, fh: u32) -> Rect {
+/// The part of the rectangle at (`x`, `y`) of size `w` x `h` that lies inside
+/// a `fw` x `fh` frame at the origin. An empty or missing rectangle, or one
+/// that misses the frame, means the whole frame.
+fn window_rect(x: i64, y: i64, w: u32, h: u32, fw: u32, fh: u32) -> Rect {
     let whole = Rect {
         x: 0,
         y: 0,
         width: fw,
         height: fh,
     };
-    let (Ok(x), Ok(y)) = (u32::try_from(x), u32::try_from(y)) else {
-        return whole;
-    };
-    if w == 0 || h == 0 || x >= fw || y >= fh {
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + i64::from(w)).min(i64::from(fw));
+    let y1 = (y + i64::from(h)).min(i64::from(fh));
+    if w == 0 || h == 0 || x0 >= x1 || y0 >= y1 {
         return whole;
     }
+    // Bounded by the frame's u32 dimensions above.
     Rect {
-        x,
-        y,
-        width: w.min(fw - x),
-        height: h.min(fh - y),
+        x: x0 as u32,
+        y: y0 as u32,
+        width: (x1 - x0) as u32,
+        height: (y1 - y0) as u32,
     }
 }
 
@@ -357,34 +368,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clamp_rect_handles_garbage() {
+    fn window_rect_intersects_and_handles_garbage() {
         let whole = Rect {
             x: 0,
             y: 0,
             width: 100,
             height: 100,
         };
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
         assert_eq!(
-            clamp_rect(0, 0, 1600, 900, 1600, 900),
-            Rect {
-                x: 0,
-                y: 0,
-                width: 1600,
-                height: 900
-            }
+            window_rect(0, 0, 1600, 900, 1600, 900),
+            rect(0, 0, 1600, 900)
         );
         assert_eq!(
-            clamp_rect(10, 20, 5000, 5000, 1600, 900),
-            Rect {
-                x: 10,
-                y: 20,
-                width: 1590,
-                height: 880
-            }
+            window_rect(10, 20, 5000, 5000, 1600, 900),
+            rect(10, 20, 1590, 880)
         );
-        assert_eq!(clamp_rect(-5, 0, 10, 10, 100, 100), whole);
-        assert_eq!(clamp_rect(0, 0, 0, 0, 100, 100), whole);
-        assert_eq!(clamp_rect(i32::MIN, i32::MAX, u32::MAX, 1, 100, 100), whole);
+        // A frame recorded at crop position (216, 204) inside a sensor
+        // buffer whose active area starts at (152, 26).
+        assert_eq!(
+            window_rect(152 - 216, 26 - 204, 1734, 1156, 1600, 800),
+            rect(0, 0, 1600, 800)
+        );
+        // A frame overlapping the masked left border by 8 columns.
+        assert_eq!(window_rect(8, -4, 200, 200, 100, 100), rect(8, 0, 92, 100));
+        assert_eq!(window_rect(-5, 0, 10, 10, 100, 100), rect(0, 0, 5, 10));
+        assert_eq!(window_rect(100, 0, 10, 10, 100, 100), whole);
+        assert_eq!(window_rect(0, 0, 0, 0, 100, 100), whole);
+        assert_eq!(
+            window_rect(
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+                u32::MAX,
+                1,
+                100,
+                100
+            ),
+            whole
+        );
     }
 
     #[test]

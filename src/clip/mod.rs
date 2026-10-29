@@ -530,6 +530,7 @@ fn index<R: ReadAt>(chunks: &[Chunk<R>]) -> Result<(Scan, ClipInfo)> {
         &scan.expo,
         &scan.wbal,
         &scan.lens,
+        scan.frames.first().map_or((0, 0), |f| f.crop_pos),
     )?;
     Ok((scan, info))
 }
