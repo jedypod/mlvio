@@ -3,6 +3,11 @@
 //!
 //! Reader for Magic Lantern Video (MLV) raw clips.
 //!
+//! The crate is layered, bottom up:
+//!
+//! - [`block`]: block tags, the 16-byte block header and one typed struct per
+//!   metadata block, all parsed from byte slices. No I/O.
+//!
 //! The output contract is a `u16` Bayer mosaic plane at the stored bit depth
 //! plus enough metadata ([`ClipInfo`]) to linearise and colour it.
 //!
@@ -15,4 +20,11 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
+
+pub mod block;
+mod error;
+
+pub use error::{Error, Lj92Error, Result, Unsupported};
+
+pub use block::{BlockHeader, Tag};
 
